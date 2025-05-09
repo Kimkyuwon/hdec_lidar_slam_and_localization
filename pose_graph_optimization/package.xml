@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <package>
-  <name>poseGraphOptimization</name>
+  <name>pose_graph_optimization</name>
   <version>0.0.0</version>
 
   <description>
@@ -22,6 +22,8 @@
   <build_depend>pcl_ros</build_depend>
   <build_depend>message_generation</build_depend>
   <build_depend>nano_gicp</build_depend>
+  <build_depend>cv_bridge</build_depend>
+  <build_depend>image_transport</build_depend>
 
   <run_depend>geometry_msgs</run_depend>
   <run_depend>nav_msgs</run_depend>
@@ -33,6 +35,8 @@
   <run_depend>pcl_ros</run_depend>
   <run_depend>message_runtime</run_depend>
   <run_depend>nano_gicp</run_depend>
+  <run_depend>cv_bridge</run_depend>
+  <run_depend>image_transport</run_depend>
 
   <export>
   </export>

@@ -10,12 +10,12 @@ preprocess:
     time_scale: 1e-3
 
 mapping:
-    acc_cov: 0.01 
-    gyr_cov: 0.01
+    acc_cov: 0.001 
+    gyr_cov: 0.001
     b_acc_cov: 0.0001
     b_gyr_cov: 0.0001
     fov_degree:    360
-    det_range:     100.0
+    det_range:     50.0
     extrinsic_est_en:  true      # true: enable the online estimation of IMU-LiDAR extrinsic,
     extrinsic_T: [ -0.001, -0.00855, 0.055]
     extrinsic_R: [0, -1, 0,
@@ -25,7 +25,7 @@ mapping:
     dop_flag: true
 
 posegraph:
-    r_solid_thres: 0.9
+    r_solid_thres: 0.95
     fov_u: 15.0
     fov_d: -16.0
     num_angle: 120
@@ -54,10 +54,10 @@ pcd_save:
 feature_extract_enable: false
 max_iteration: 5
 filter_size_surf: 0.4
-filter_size_map: 0.5             # 暂时未用到，代码中为0， 即倾向于将降采样后的scan中的所有点加入map
+filter_size_map: 0.2             # 暂时未用到，代码中为0， 即倾向于将降采样后的scan中的所有点加入map
 cube_side_length: 1000
 
-ivox_grid_resolution: 0.5        # default=0.2
+ivox_grid_resolution: 0.1        # default=0.2
 ivox_nearby_type: 18             # 6, 18, 26
 esti_plane_threshold: 0.1        # default=0.1
 point_filter_num: 4

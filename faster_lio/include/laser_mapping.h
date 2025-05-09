@@ -4,10 +4,15 @@
 #include <livox_ros_driver/CustomMsg.h>
 #include <nav_msgs/Path.h>
 #include <pcl/filters/voxel_grid.h>
+#include <pcl/filters/statistical_outlier_removal.h>
+#include <pcl/filters/conditional_removal.h>
 #include <ros/ros.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <condition_variable>
 #include <thread>
+#include <unordered_map>
+#include <cmath>
+#include <limits>
 
 #include "imu_processing.hpp"
 #include "ivox3d/ivox3d.h"
@@ -15,6 +20,7 @@
 #include "pointcloud_preprocess.h"
 
 using namespace std;
+
 namespace faster_lio {
 
 class LaserMapping {
@@ -59,7 +65,7 @@ class LaserMapping {
     void PublishPath(const ros::Publisher pub_path);
     void PublishOdometry(const ros::Publisher &pub_odom_aft_mapped);
     void PublishFrameWorld();
-    void PublishFrameBody(const ros::Publisher &pub_laser_cloud_body);
+    void PublishMap();
     void PublishFrameEffectWorld(const ros::Publisher &pub_laser_cloud_effect_world);
     void Savetrajectory(const std::string &traj_file);
 
@@ -75,6 +81,8 @@ class LaserMapping {
 
     void MapIncremental();
 
+    double computeDOP(const PointCloudType::Ptr& cloud, Eigen::Vector3d pos);
+    
     void SubAndPubToROS(ros::NodeHandle &nh);
 
     bool LoadParams(ros::NodeHandle &nh);
@@ -93,12 +101,12 @@ class LaserMapping {
     float det_range_ = 300.0f;
     double cube_len_ = 0;
     double filter_size_map_min_ = 0;
-    double filter_size_map_ad_ = 0;
     double filter_size_surf_min_ = 0;
     double filter_size_surf_ad_ = 0;
-    double point_filter_ad_ = 0;
+    int point_filter_ad_ = 0;
     int point_filter_ = 0;
-    bool localmap_initialized_ = false;
+    double matching_dop = 0, scan_dop = 0;
+
 
     /// params
     std::vector<double> extrinT_{3, 0.0};  // lidar-imu translation
@@ -110,7 +118,7 @@ class LaserMapping {
     CloudPtr scan_down_body_{new PointCloudType()};   // downsampled scan in body
     CloudPtr scan_down_world_{new PointCloudType()};  // downsampled scan in world
     CloudPtr dop_cloud {new PointCloudType()};
-
+    
     std::vector<PointVector> nearest_points_;         // nearest points of current scan
     common::VV4F corr_pts_;                           // inlier pts
     common::VV4F corr_norm_;                          // inlier plane norms
@@ -125,9 +133,11 @@ class LaserMapping {
     ros::Publisher pub_laser_cloud_world_;
     ros::Publisher pub_laser_cloud_body_;
     ros::Publisher pub_laser_cloud_effect_world_;
+    ros::Publisher pub_laser_cloud_map_;
     ros::Publisher pub_odom_aft_mapped_;
     ros::Publisher pub_path_;
-    ros::Publisher pubKeyFrame;
+    ros::Publisher pub_dop_;
+    ros::Publisher pubKeyFrame;    
 
     std::string tf_imu_frame_;
     std::string tf_world_frame_;
@@ -184,7 +194,7 @@ class LaserMapping {
     bool path_save_en_ = false;
     std::string dataset_;
 
-    PointCloudType::Ptr pcl_wait_save_{new PointCloudType()};  // debug save
+    PointCloudType::Ptr pcl_wait_save_{new PointCloudType()}; 
     nav_msgs::Path path_;
     geometry_msgs::PoseStamped msg_body_pose_;
 };

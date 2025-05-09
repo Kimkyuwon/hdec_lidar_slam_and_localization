@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 2.8.3)
-project(poseGraphOptimization)
+project(pose_graph_optimization)
 
 SET(CMAKE_BUILD_TYPE "Release")
 
@@ -57,8 +57,11 @@ find_package(catkin REQUIRED COMPONENTS
   eigen_conversions
   genmsg
   nano_gicp
+  cv_bridge
+  image_transport
 )
 
+find_package(OpenCV REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(PCL 1.8 REQUIRED)
 
@@ -69,6 +72,7 @@ include_directories(
   ${EIGEN3_INCLUDE_DIR}
   ${PCL_INCLUDE_DIRS}
   ${PYTHON_INCLUDE_DIRS}
+  ${OpenCV_INCLUDE_DIRS}
   ${GTSAM_INCLUDE_DIR}
   include)
 
@@ -91,8 +95,8 @@ catkin_package(
   INCLUDE_DIRS
 )
 
-add_executable(poseGraphOptimization src/poseGraphOptimization.cpp
+add_executable(pose_graph_optimization src/poseGraphOptimization.cpp
                 include/solid/solid.cpp)
-target_link_libraries(poseGraphOptimization ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} ${OpenMP_CXX_FLAGS} gtsam)
-target_include_directories(poseGraphOptimization PRIVATE ${PYTHON_INCLUDE_DIRS})
-add_dependencies(poseGraphOptimization poseGraphOptimization_generate_messages_cpp)
+target_link_libraries(pose_graph_optimization ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} ${OpenCV_LIBRARIES} ${OpenMP_CXX_FLAGS} gtsam)
+target_include_directories(pose_graph_optimization PRIVATE ${PYTHON_INCLUDE_DIRS})
+add_dependencies(pose_graph_optimization pose_graph_optimization_generate_messages_cpp)

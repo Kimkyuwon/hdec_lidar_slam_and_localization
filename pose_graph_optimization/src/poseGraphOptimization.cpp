@@ -24,6 +24,10 @@
 #include <pcl/console/print.h>
 #include <pcl/kdtree/kdtree_flann.h>
 #include <sensor_msgs/PointCloud2.h>
+#include <sensor_msgs/Image.h>
+#include <cv_bridge/cv_bridge.h>
+#include <opencv2/opencv.hpp>
+#include <image_transport/image_transport.h>
 #include <tf/transform_datatypes.h>
 #include <tf/transform_broadcaster.h>
 #include <tf2/LinearMath/Quaternion.h>
@@ -78,7 +82,7 @@ int MIN_DISTANCE, MAX_DISTANCE, NUM_EXCLUDE_RECENT, NUM_CANDIDATES_FROM_TREE;
 queue<tuple<int, int, Eigen::Matrix4f>> solidLoopBuf; 
 
 // edge measurement params
-pcl::VoxelGrid<PointType> downSizeFilter_map;
+pcl::VoxelGrid<pcl::PointXYZI> downSizeFilter_map;
 nano_gicp::NanoGICP<PointType2, PointType2> gicp;
 std::vector<int> pointSearchInd;
 std::vector<float> pointSearchSqDis;
@@ -101,8 +105,16 @@ noiseModel::Diagonal::shared_ptr odomNoise;
 noiseModel::Base::shared_ptr robustLoopNoise;
 int recentIdxUpdated = 0;
 
+//range image 
+std::vector<std::vector<double>> scan_range_data;
+std::vector<std::vector<double>> map_range_data;
+int horizontal_resolution = static_cast<int>(2*M_PI/0.02);
+double LIDAR_HOR_MIN = -180.0F;
+double LIDAR_HOR_MAX = 180.0F;
+
 visualization_msgs::Marker loopLine;
 nav_msgs::Path PGO_path;
+pcl::PointCloud<pcl::PointXYZI>::Ptr MapCloud(new pcl::PointCloud<pcl::PointXYZI>());
 
 fstream odom_stream, optimized_stream;
 pcl::PointCloud<pcl::PointXYZI> kf_nodes;
@@ -113,6 +125,8 @@ ros::Publisher kf_node_pub;
 ros::Publisher LoopLineMarker_pub;
 ros::Publisher PubPGO_path;
 ros::Publisher PubPGO_map;
+image_transport::Publisher PubScan_range; 
+image_transport::Publisher PubMap_range;
 
 void initNoises( void )
 {
@@ -147,6 +161,68 @@ Pose6 getOdom(nav_msgs::Odometry _odom)
 
     return Pose6{tx, ty, tz, roll, pitch, yaw};
 } // getOdom
+void insertPoint(const pcl::PointXYZI& pt, std::vector<std::vector<double>> &ri) 
+{
+    double range = std::sqrt(pt.x * pt.x + pt.y * pt.y + pt.z * pt.z);
+    if (range < 0.2) return;
+
+    double azimuth = std::atan2(pt.y, pt.x);
+    double elevation = std::asin(pt.z / range);
+
+    double vertical_fov_min = FOV_d*M_PI/180; 
+    double vertical_fov_max = FOV_u*M_PI/180;
+    double horizontal_fov_min = LIDAR_HOR_MIN*M_PI/180;    
+    double horizontal_fov_max = LIDAR_HOR_MAX*M_PI/180;
+    if (azimuth < horizontal_fov_min || azimuth > horizontal_fov_max ||
+        elevation < vertical_fov_min || elevation > vertical_fov_max) return;
+
+    int col = static_cast<int>((azimuth - horizontal_fov_min) / (horizontal_fov_max - horizontal_fov_min) * horizontal_resolution);
+    int row = static_cast<int>((elevation - vertical_fov_min) / (vertical_fov_max - vertical_fov_min) * NUM_HEIGHT);
+
+    if (row < 0) row = 0;
+    if (row >= NUM_HEIGHT) row = NUM_HEIGHT - 1;
+    if (col < 0) col = 0;
+    if (col >= horizontal_resolution) col = horizontal_resolution - 1;
+
+    if (range < ri[row][col]) 
+    {
+        ri[row][col] = range;
+    }
+}
+
+cv::Mat toColorizedCVImage(std::vector<std::vector<double>> &ri) 
+{
+    cv::Mat img(NUM_HEIGHT, horizontal_resolution, CV_8UC1, cv::Scalar(0));
+
+    for (int i = 0; i < NUM_HEIGHT; ++i) {
+        for (int j = 0; j < horizontal_resolution; ++j) {
+            if (!std::isinf(ri[i][j])) {
+                double norm_range = std::min(ri[i][j] / static_cast<double>(MAX_DISTANCE), 1.0);
+                img.at<uchar>(i, j) = static_cast<uchar>((1.0 - norm_range) * 255);
+            }
+        }
+    }
+
+    cv::Mat color_img;
+    cv::applyColorMap(img, color_img, cv::COLORMAP_JET);
+    cv::flip(color_img, color_img, 0); // 0은 상하 반전
+    return color_img;
+}
+
+Eigen::Matrix4f get_TF_Matrix(const Pose6 Pose)
+{
+    Eigen::Matrix3f rotation;
+    rotation = Eigen::AngleAxisf(Pose.yaw, Eigen::Vector3f::UnitZ())
+             * Eigen::AngleAxisf(Pose.pitch, Eigen::Vector3f::UnitY())
+             * Eigen::AngleAxisf(Pose.roll, Eigen::Vector3f::UnitX());
+    Eigen::Matrix4f TF(Eigen::Matrix4f::Identity());
+    TF.block(0,0,3,3) = rotation;
+    TF(0,3) = Pose.x;
+    TF(1,3) = Pose.y;
+    TF(2,3) = Pose.z;
+
+    return TF;
+}
 
 void kf_callback(const Frame::ConstPtr &kf_msg) 
 {
@@ -164,10 +240,40 @@ void kf_callback(const Frame::ConstPtr &kf_msg)
     pcl::PointCloud<pcl::PointXYZI>::Ptr curr_kf_pc (new pcl::PointCloud<pcl::PointXYZI>());
     pcl::PointCloud<pcl::PointXYZI>::Ptr curr_kf_pc_down (new pcl::PointCloud<pcl::PointXYZI>());
     pcl::fromROSMsg(pc_msg, *curr_kf_pc);
-    pcl::io::savePCDFileBinary(ScansDirectory + to_string(curr_kf_idx) + ".pcd", *curr_kf_pc); // scan data
-    
     solidModule.down_sampling(*curr_kf_pc, curr_kf_pc_down);
     solidModule.makeAndSaveSolid(*curr_kf_pc_down);
+            
+    // scan_range_data.clear();
+    // scan_range_data.resize(NUM_HEIGHT, std::vector<double>(horizontal_resolution, std::numeric_limits<double>::infinity()));
+    // for (const auto& pt : curr_kf_pc_down->points)
+    // {
+    //     insertPoint(pt, scan_range_data);
+    // }
+    // cv::Mat img = toColorizedCVImage(scan_range_data);
+    // sensor_msgs::ImagePtr scanRange_msg = cv_bridge::CvImage(std_msgs::Header(), "bgr8", img).toImageMsg();
+    // scanRange_msg->header.stamp = curr_pose.header.stamp;
+    // scanRange_msg->header.frame_id = "camera_init";    
+    // PubScan_range.publish(scanRange_msg);
+
+    // map_range_data.clear();
+    // map_range_data.resize(NUM_HEIGHT, std::vector<double>(horizontal_resolution, std::numeric_limits<double>::infinity()));
+    
+    // Eigen::Matrix4f curr_TF = get_TF_Matrix(pose_curr);
+    // pcl::PointCloud<pcl::PointXYZI>::Ptr curr_MapCloud(new pcl::PointCloud<pcl::PointXYZI>());
+    // pcl::transformPointCloud(*MapCloud, *curr_MapCloud, curr_TF.inverse());
+    // for (const auto& pt : curr_MapCloud->points)
+    // {
+    //     insertPoint(pt, map_range_data);
+    // }
+    // cv::Mat map_img = toColorizedCVImage(map_range_data);
+    // sensor_msgs::ImagePtr mapRange_msg = cv_bridge::CvImage(std_msgs::Header(), "bgr8", map_img).toImageMsg();
+    // mapRange_msg->header.stamp = curr_pose.header.stamp;
+    // mapRange_msg->header.frame_id = "camera_init";    
+    // PubMap_range.publish(mapRange_msg);
+
+         
+    pcl::io::savePCDFileBinary(ScansDirectory + to_string(curr_kf_idx) + ".pcd", *curr_kf_pc_down); // scan data
+    
 
     const int prev_node_idx = keyframePoses.size() - 2;
     const int curr_node_idx = keyframePoses.size() - 1; // becuase cpp starts with 0 (actually this index could be any number, but for simple implementation, we follow sequential indexing)
@@ -223,21 +329,6 @@ void kf_callback(const Frame::ConstPtr &kf_msg)
     double timeLaserOdometry = curr_kf.pose.header.stamp.toSec();
     keyframeTimes.push_back(timeLaserOdometry);
     mBuf.unlock();
-}
-
-Eigen::Matrix4f get_TF_Matrix(const Pose6 Pose)
-{
-    Eigen::Matrix3f rotation;
-    rotation = Eigen::AngleAxisf(Pose.yaw, Eigen::Vector3f::UnitZ())
-             * Eigen::AngleAxisf(Pose.pitch, Eigen::Vector3f::UnitY())
-             * Eigen::AngleAxisf(Pose.roll, Eigen::Vector3f::UnitX());
-    Eigen::Matrix4f TF(Eigen::Matrix4f::Identity());
-    TF.block(0,0,3,3) = rotation;
-    TF(0,3) = Pose.x;
-    TF(1,3) = Pose.y;
-    TF(2,3) = Pose.z;
-
-    return TF;
 }
 
 void updatePoses(void)
@@ -306,13 +397,19 @@ void performSOLiDLoopClosure(void)
         dist_vec(2) = keyframePoses[curr_node_idx].z - keyframePoses[prev_node_idx].z;
         double dist = dist_vec.norm();
 
-        if (dist > 40.0) return;
+        if (dist > 50.0) return;
 
-        Eigen::Matrix4f to_TF = get_TF_Matrix(keyframePoses[curr_node_idx]);
-        Eigen::Matrix4f from_TF = get_TF_Matrix(keyframePoses[prev_node_idx]);
-        Eigen::Matrix4f delta_TF = from_TF.inverse() * to_TF;
+        // Eigen::Matrix4f to_TF = get_TF_Matrix(keyframePoses[curr_node_idx]);
+        // Eigen::Matrix4f from_TF = get_TF_Matrix(keyframePoses[prev_node_idx]);
+        // Eigen::Matrix4f delta_TF = from_TF.inverse() * to_TF;
+        Eigen::Matrix4f delta_TF (Eigen::Matrix4f::Identity());
+        Eigen::Matrix3f rotation;
+            rotation = Eigen::AngleAxisf(std::get<2>(detectResult), Eigen::Vector3f::UnitZ())
+                     * Eigen::AngleAxisf(0, Eigen::Vector3f::UnitY())
+                     * Eigen::AngleAxisf(0, Eigen::Vector3f::UnitX());
+        delta_TF.block(0,0,3,3) = rotation;
 
-        if (solidLoopBuf.size() <= 5)
+        if (solidLoopBuf.size() <= 10)
         {
             solidLoopBuf.push(std::make_tuple(prev_node_idx, curr_node_idx, delta_TF));
         }        
@@ -326,14 +423,9 @@ std::optional<gtsam::Pose3> doGICPVirtualRelative( int _loop_kf_idx, int _curr_k
     pcl::io::loadPCDFile(ScansDirectory + std::to_string(_curr_kf_idx) + ".pcd", *cureKeyframeCloud);
     pcl::io::loadPCDFile(ScansDirectory + std::to_string(_loop_kf_idx) + ".pcd", *targetKeyframeCloud);
 
-    pcl::PointCloud<pcl::PointXYZI>::Ptr cureKeyframeCloud2(new pcl::PointCloud<pcl::PointXYZI>());
-    pcl::PointCloud<pcl::PointXYZI>::Ptr targetKeyframeCloud2(new pcl::PointCloud<pcl::PointXYZI>());
-    *cureKeyframeCloud2 = *cureKeyframeCloud;
-    *targetKeyframeCloud2 = *targetKeyframeCloud;
-
-    gicp.setInputTarget(targetKeyframeCloud2);
+    gicp.setInputTarget(targetKeyframeCloud);
     // gicp.calculateSourceCovariances();
-    gicp.setInputSource(cureKeyframeCloud2);
+    gicp.setInputSource(cureKeyframeCloud);
     // gicp.calculateTargetCovariances();
 
     pcl::PointCloud<pcl::PointXYZI>::Ptr aligned_cloud(new pcl::PointCloud<pcl::PointXYZI>());
@@ -452,7 +544,7 @@ std::optional<gtsam::Pose3> doGICPVirtualRelative( int _loop_kf_idx, int _curr_k
 
 void process_lcd(void)
 {
-    float loopClosureFrequency = 2; // can change 
+    float loopClosureFrequency = 0.5; // can change 
     ros::Rate rate(loopClosureFrequency);
     while (ros::ok())
     {
@@ -516,7 +608,8 @@ void process_viz(void)
     while(1)
     {
         mViz.lock();
-        pcl::PointCloud<PointType>::Ptr VizMapCloud(new pcl::PointCloud<PointType>());
+        pcl::PointCloud<pcl::PointXYZI>::Ptr VizMapCloud(new pcl::PointCloud<pcl::PointXYZI>());
+        VizMapCloud->points.clear();
         for (int i = 0; i < recentIdxUpdated; i++)
         {   
             double dist = sqrt(pow(keyframePosesUpdated.back().x-keyframePosesUpdated[i].x,2)
@@ -534,7 +627,7 @@ void process_viz(void)
             TF(1,3) = keyframePosesUpdated[i].y;
             TF(2,3) = keyframePosesUpdated[i].z;
             
-            pcl::PointCloud<PointType>::Ptr cureKeyframeCloud(new pcl::PointCloud<PointType>());
+            pcl::PointCloud<pcl::PointXYZI>::Ptr cureKeyframeCloud(new pcl::PointCloud<pcl::PointXYZI>());
             pcl::io::loadPCDFile(ScansDirectory + std::to_string(i) + ".pcd", *cureKeyframeCloud);
             pcl::transformPointCloud(*cureKeyframeCloud, *cureKeyframeCloud, TF);
             *VizMapCloud += *cureKeyframeCloud; 
@@ -547,6 +640,8 @@ void process_viz(void)
         map_msg.header.frame_id = "camera_init";
         PubPGO_map.publish(map_msg);
         mViz.unlock();
+        MapCloud->points.clear();
+        *MapCloud = *VizMapCloud;
 
         std::chrono::milliseconds dura(2);
         std::this_thread::sleep_for(dura);
@@ -580,9 +675,10 @@ void SigHandle(int sig)
         *OptimizedMapCloud += *cureKeyframeCloud;
     }
 
-    downSizeFilter_map.setLeafSize(0.4, 0.4, 0.4);
-    downSizeFilter_map.setInputCloud(OptimizedMapCloud);
-    downSizeFilter_map.filter(*OptimizedMapCloud);
+    pcl::VoxelGrid<PointType> downSizeFilter;
+    downSizeFilter.setLeafSize(0.4, 0.4, 0.4);
+    downSizeFilter.setInputCloud(OptimizedMapCloud);
+    downSizeFilter.filter(*OptimizedMapCloud);
     pcl::io::savePCDFileBinary(save_directory + "OptimizedMap.pcd", *OptimizedMapCloud); 
 
     ROS_INFO("Optimization trajectory file saved.");
@@ -592,8 +688,10 @@ void SigHandle(int sig)
 
 int main(int argc, char** argv)
 {
-    ros::init(argc, argv, "poseGraphOptimization");
+    ros::init(argc, argv, "pose_graph_optimization");
     ros::NodeHandle nh;
+    image_transport::ImageTransport it(nh);
+
     save_directory = string(ROOT_DIR) + "Map/";
     auto unused = system((std::string("exec rm -r ") + save_directory).c_str());
     unused = system((std::string("mkdir -p ") + save_directory).c_str());
@@ -663,6 +761,8 @@ int main(int argc, char** argv)
     LoopLineMarker_pub = nh.advertise<visualization_msgs::Marker>("/loopLine", 1);
     PubPGO_path = nh.advertise<nav_msgs::Path>("/PGO_path", 1);
     PubPGO_map = nh.advertise<sensor_msgs::PointCloud2>("/PGO_map", 1);
+    PubScan_range = it.advertise("/scan_range_image", 1);
+    PubMap_range = it.advertise("/map_range_image", 1);
 
     pcl::console::setVerbosityLevel(pcl::console::L_ALWAYS);
 

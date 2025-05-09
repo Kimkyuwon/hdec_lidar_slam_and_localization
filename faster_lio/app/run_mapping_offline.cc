@@ -81,8 +81,8 @@ int main(int argc, char **argv) {
         }
     }
 
-    LOG(INFO) << "finishing mapping";
-    laser_mapping->Finish();
+    //LOG(INFO) << "finishing mapping";
+    //laser_mapping->Finish();
 
     /// print the fps
     double fps = 1.0 / (faster_lio::Timer::GetMeanTime("Laser Mapping Single Run") / 1000.);

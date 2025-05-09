@@ -49,14 +49,17 @@ class Timer {
 
     /// print the run time
     static void PrintAll() {
+        double all_time = 0;
         LOG(INFO) << ">>> ===== Printing run time =====";
         for (const auto& r : records_) {
             LOG(INFO) << "> [ " << r.first << " ] average time usage: "
                       << std::accumulate(r.second.time_usage_in_ms_.begin(), r.second.time_usage_in_ms_.end(), 0.0) /
                              double(r.second.time_usage_in_ms_.size())
                       << " ms , called times: " << r.second.time_usage_in_ms_.size();
+                      all_time += std::accumulate(r.second.time_usage_in_ms_.begin(), r.second.time_usage_in_ms_.end(), 0.0) /
+                             double(r.second.time_usage_in_ms_.size());
         }
-        LOG(INFO) << ">>> ===== Printing run time end =====";
+        LOG(INFO) << ">>> == Printing run time end. Overall time : "<< all_time << "ms. ==";
     }
 
     /// dump to a log file

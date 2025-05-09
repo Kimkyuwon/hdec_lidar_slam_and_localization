@@ -129,8 +129,7 @@ bool LaserMapping::LoadParams(ros::NodeHandle &nh) {
     path_.header.frame_id = "camera_init";
 
     filter_size_surf_ad_ = filter_size_surf_min_;
-    filter_size_map_ad_ = filter_size_map_min_;
-    preprocess_->PointFilterNum() = point_filter_;
+    point_filter_ad_ = point_filter_;
     voxel_scan_.setLeafSize(filter_size_surf_ad_, filter_size_surf_ad_, filter_size_surf_ad_);
 
     lidar_meas_cov = options::LASER_POINT_COV;
@@ -225,8 +224,7 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
     }
 
     filter_size_surf_ad_ = filter_size_surf_min_;
-    filter_size_map_ad_ = filter_size_map_min_;
-    preprocess_->PointFilterNum() = point_filter_;
+    point_filter_ad_ = point_filter_;
     voxel_scan_.setLeafSize(filter_size_surf_ad_, filter_size_surf_ad_, filter_size_surf_ad_);
 
     lidar_meas_cov = options::LASER_POINT_COV;
@@ -265,12 +263,15 @@ void LaserMapping::SubAndPubToROS(ros::NodeHandle &nh) {
     path_.header.stamp = ros::Time::now();
     path_.header.frame_id = "camera_init";
 
-    pub_laser_cloud_world_ = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 100000);
-    pub_laser_cloud_body_ = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered_body", 100000);
-    pub_laser_cloud_effect_world_ = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered_effect_world", 100000);
-    pub_odom_aft_mapped_ = nh.advertise<nav_msgs::Odometry>("/Odometry", 100000);
-    pub_path_ = nh.advertise<nav_msgs::Path>("/path", 100000);
+    // pub_laser_cloud_world_ = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 10);
+    // pub_laser_cloud_body_ = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered_body", 10);
+    pub_laser_cloud_effect_world_ = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered_effect_world", 10);
+    pub_laser_cloud_map_ = nh.advertise<sensor_msgs::PointCloud2>("/cloud_map", 1);
+    pub_odom_aft_mapped_ = nh.advertise<nav_msgs::Odometry>("/Odometry", 100);
+    pub_path_ = nh.advertise<nav_msgs::Path>("/path", 1);
+    pub_dop_ = nh.advertise<nav_msgs::Odometry>("/dop", 10);
     pubKeyFrame = nh.advertise<Frame> ("/key_frame", 10);
+
 }
 
 LaserMapping::LaserMapping() {
@@ -309,14 +310,48 @@ void LaserMapping::Run() {
     }
     flg_EKF_inited_ = (measures_.lidar_bag_time_ - first_lidar_time_) >= options::INIT_TIME;
 
+    if (dop_flag)
+    {
+        Timer::Evaluate(
+            [&, this]() {
+                scan_dop = computeDOP(scan_undistort_, Eigen::Vector3d(0,0,0));
+                double dop_scale = 1;
+                double c = 2;
+                double r = scan_dop;
+
+                //tukey loss function
+                double scale = pow(c,2)*(1-pow((1-pow((r/c),2)),3))*dop_scale;
+                if (r >= c)  scale = pow(c,2)*dop_scale; 
+                
+                double voxel_scale = 1.0/scale;
+                filter_size_surf_ad_ = voxel_scale * filter_size_surf_min_;
+                if (filter_size_surf_ad_ < 0.1)  filter_size_surf_ad_ = 0.1;
+                else if (filter_size_surf_ad_ > 1.2) filter_size_surf_ad_ = 1.2;
+                
+                point_filter_ad_ = static_cast<int>(voxel_scale * point_filter_);
+                if (point_filter_ad_ <= 1)  point_filter_ad_ = 1;
+                else if (point_filter_ad_ >= preprocess_->NumScans() / 2)   point_filter_ad_ = static_cast<int>(preprocess_->NumScans() / 2);
+            },
+            "Adaptive Parameter");
+    }
+
     /// downsample
     Timer::Evaluate(
         [&, this]() {
+            PointCloudType::Ptr temp_pointCloud(new PointCloudType());
+            for (int i = 0; i < scan_undistort_->points.size(); i++)
+            {
+                if (i % point_filter_ad_ == 0) 
+                {
+                    temp_pointCloud->points.push_back(scan_undistort_->points[i]);
+                }
+            }
             voxel_scan_.setLeafSize(filter_size_surf_ad_, filter_size_surf_ad_, filter_size_surf_ad_);
-            voxel_scan_.setInputCloud(scan_undistort_);
+            voxel_scan_.setInputCloud(temp_pointCloud);
             voxel_scan_.filter(*scan_down_body_);
         },
         "Downsample PointCloud");
+
 
     int cur_pts = scan_down_body_->size();
     if (cur_pts < 5) {
@@ -344,44 +379,25 @@ void LaserMapping::Run() {
         "IEKF Solve and Update");
 
     // update local map
-    Timer::Evaluate([&, this]() { MapIncremental(); }, "    Incremental Mapping");
+    Timer::Evaluate(
+        [&, this]() {   MapIncremental(); }, 
+        "Incremental Mapping");
 
-    // LOG(INFO) << "[ mapping ]: In num: " << scan_undistort_->points.size() << " downsamp " << cur_pts
-    //           << " Map grid num: " << ivox_->NumValidGrids() << " effect num : " << effect_feat_num_;
+    PublishOdometry(pub_odom_aft_mapped_);
 
-    // publish or save map pcd
-    if (run_in_offline_) {
-        if (pcd_save_en_) {
-            PublishFrameWorld();
-        }
-        if (path_save_en_) {
-            PublishPath(pub_path_);
-        }
-    } else {
-        if (pub_odom_aft_mapped_) {
-            PublishOdometry(pub_odom_aft_mapped_);
-        }
-        if (path_pub_en_ || path_save_en_) {
-            PublishPath(pub_path_);
-        }
-        if (scan_pub_en_ || pcd_save_en_) {
-            PublishFrameWorld();
-        }
-        if (scan_pub_en_ && scan_body_pub_en_) {
-            PublishFrameBody(pub_laser_cloud_body_);
-        }
-        if (scan_pub_en_ && scan_effect_pub_en_) {
-            PublishFrameEffectWorld(pub_laser_cloud_effect_world_);
-        }
+    PublishPath(pub_path_);
+    
+    PublishMap();
+    
+    PublishFrameEffectWorld(pub_laser_cloud_effect_world_);    
 
-        /******* Publish key frame *******/
-        double kf_dist = (pos_lidar_ - prev_kf_pos).norm();
-        if (kf_dist > kf_thres_)
-        {
-            PublishKeyFrame(pubKeyFrame);
-            prev_kf_pos = pos_lidar_;
-        }
-    }
+    /******* Publish key frame *******/
+    double kf_dist = (pos_lidar_ - prev_kf_pos).norm();
+    if (kf_dist > kf_thres_)
+    {
+        PublishKeyFrame(pubKeyFrame);
+        prev_kf_pos = pos_lidar_;
+    }   
 
     // Debug variables
     frame_num_++;
@@ -537,13 +553,13 @@ void LaserMapping::MapIncremental() {
             const PointVector &points_near = nearest_points_[i];
 
             Eigen::Vector3f center =
-                ((point_world.getVector3fMap() / filter_size_map_ad_).array().floor() + 0.5) * filter_size_map_ad_;
+                ((point_world.getVector3fMap() / filter_size_map_min_).array().floor() + 0.5) * filter_size_map_min_;
 
             Eigen::Vector3f dis_2_center = points_near[0].getVector3fMap() - center;
 
-            if (fabs(dis_2_center.x()) > 0.5 * filter_size_map_ad_ &&
-                fabs(dis_2_center.y()) > 0.5 * filter_size_map_ad_ &&
-                fabs(dis_2_center.z()) > 0.5 * filter_size_map_ad_) {
+            if (fabs(dis_2_center.x()) > 0.5 * filter_size_map_min_ &&
+                fabs(dis_2_center.y()) > 0.5 * filter_size_map_min_ &&
+                fabs(dis_2_center.z()) > 0.5 * filter_size_map_min_) {
                 point_no_need_downsample.emplace_back(point_world);
                 return;
             }
@@ -620,10 +636,14 @@ void LaserMapping::ObsModel(state_ikfom &s, esekfom::dyn_share_datastruct<double
                     temp[3] = 1.0;
                     float pd2 = plane_coef_[i].dot(temp);
 
-                    bool valid_corr = p_body.norm() > 81 * pd2 * pd2;
+                    bool valid_corr = p_body.norm() > 64 * pd2 * pd2; 
                     if (valid_corr) {
                         point_selected_surf_[i] = true;
                         residuals_[i] = pd2;
+                    }
+                    else
+                    {
+                        point_selected_surf_[i] = false;
                     }
                 }
             });
@@ -655,61 +675,15 @@ void LaserMapping::ObsModel(state_ikfom &s, esekfom::dyn_share_datastruct<double
 
     if (dop_flag)
     {
-        pcl::VoxelGrid<PointType> downSizeFilterDOP;
-        downSizeFilterDOP.setLeafSize(2, 2, 2);
-        downSizeFilterDOP.setInputCloud(dop_cloud);
-        downSizeFilterDOP.filter(*dop_cloud);
-        std::vector<Eigen::Vector3d> range_info;
-        for (size_t k = 0; k < dop_cloud->points.size(); k++)
-        {
-            double r = sqrt(pow(dop_cloud->points[k].x, 2) + pow(dop_cloud->points[k].y, 2) + pow(dop_cloud->points[k].z, 2));
-            if (r < preprocess_->Blind())    continue;
-            Eigen::Vector3d r_info;
-            r_info(0) = dop_cloud->points[k].x / r;
-            r_info(1) = dop_cloud->points[k].y / r;
-            r_info(2) = dop_cloud->points[k].z / r;
-            range_info.push_back(r_info);    
-        }
-        Eigen::MatrixXd AA(range_info.size(), 3);
-        for (size_t p = 0; p < range_info.size(); p++)
-        {
-            AA(p, 0) = range_info[p](0);
-            AA(p, 1) = range_info[p](1);
-            AA(p, 2) = range_info[p](2);
-        }
-        Eigen::Matrix3d A_sq;
-        Eigen::Matrix3d Q;
-        A_sq = AA.transpose() * AA;
-        Q = A_sq.inverse();
-
-        double pdop = sqrt(Q(0, 0) + Q(1, 1) + Q(2, 2));
-        if (pdop == 0 || pdop > 100 || std::isnan(pdop) == true)
-        {
-            pdop = 100;
-        }
+        matching_dop = computeDOP(dop_cloud, Eigen::Vector3d(0,0,0));
         double dop_scale = 1;
         double c = 3;
-        double r = pdop;
+        double r = matching_dop;
 
         //tukey loss function
         double scale = pow(c,2)*(1-pow((1-pow((r/c),2)),3))*dop_scale;
-        if (pdop >= c)  scale = pow(c,2)*dop_scale;   
+        if (r >= c)  scale = pow(c,2)*dop_scale;   
         lidar_meas_cov = scale * options::LASER_POINT_COV;
-
-        double voxel_scale = 1.0/scale;
-        filter_size_surf_ad_ = voxel_scale * filter_size_surf_min_;
-        if (filter_size_surf_ad_ < 0.1)  filter_size_surf_ad_ = 0.1;
-        else if (filter_size_surf_ad_ > 1.0) filter_size_surf_ad_ = 1.0;
-        
-        point_filter_ad_ = voxel_scale * point_filter_;
-        preprocess_->PointFilterNum() = static_cast<int>(point_filter_ad_);
-        if (preprocess_->PointFilterNum() <= 1)  preprocess_->PointFilterNum() = 1;
-        else if (preprocess_->PointFilterNum() >= 8) preprocess_->PointFilterNum() = 8;
-        
-
-        if (scale > 3)  options::ESTI_PLANE_THRESHOLD = 0.05;
-        else    options::ESTI_PLANE_THRESHOLD = 0.1;
-        
     }
 
     if (effect_feat_num_ < 1) {
@@ -826,67 +800,39 @@ void LaserMapping::PublishOdometry(const ros::Publisher &pub_odom_aft_mapped) {
     br.sendTransform(tf::StampedTransform(transform, odom_aft_mapped_.header.stamp, tf_world_frame_, tf_imu_frame_));
 }
 
-void LaserMapping::PublishFrameWorld() {
-    if (!(run_in_offline_ == false && scan_pub_en_) && !pcd_save_en_) {
-        return;
-    }
+void LaserMapping::PublishMap()
+{
+    *pcl_wait_save_ += *scan_down_world_;
+    pcl::VoxelGrid<PointType> downSizeFilterMap;
+    downSizeFilterMap.setLeafSize(filter_size_map_min_, filter_size_map_min_, filter_size_map_min_);
+    downSizeFilterMap.setInputCloud(pcl_wait_save_);
+    downSizeFilterMap.filter(*pcl_wait_save_);
+    pcl::ConditionAnd<PointType>::Ptr range_cond(new pcl::ConditionAnd<PointType>());
+    range_cond->addComparison(pcl::FieldComparison<PointType>::ConstPtr(new pcl::FieldComparison<PointType>("x", pcl::ComparisonOps::GT, state_point_.pos(0) - det_range_)));
+    range_cond->addComparison(pcl::FieldComparison<PointType>::ConstPtr(new pcl::FieldComparison<PointType>("x", pcl::ComparisonOps::LT, state_point_.pos(0) + det_range_)));
+    range_cond->addComparison(pcl::FieldComparison<PointType>::ConstPtr(new pcl::FieldComparison<PointType>("y", pcl::ComparisonOps::GT, state_point_.pos(1) - det_range_)));
+    range_cond->addComparison(pcl::FieldComparison<PointType>::ConstPtr(new pcl::FieldComparison<PointType>("y", pcl::ComparisonOps::LT, state_point_.pos(1) + det_range_)));
 
-    PointCloudType::Ptr laserCloudWorld;
-    if (dense_pub_en_) {
-        PointCloudType::Ptr laserCloudFullRes(scan_undistort_);
-        int size = laserCloudFullRes->points.size();
-        laserCloudWorld.reset(new PointCloudType(size, 1));
-        for (int i = 0; i < size; i++) {
-            PointBodyToWorld(&laserCloudFullRes->points[i], &laserCloudWorld->points[i]);
-        }
-    } else {
-        laserCloudWorld = scan_down_world_;
-    }
+    // build the filter
+    pcl::ConditionalRemoval<PointType> condrem;
+    condrem.setCondition(range_cond);
+    condrem.setInputCloud(pcl_wait_save_);
+    condrem.setKeepOrganized(true);
+    // apply filter
+    condrem.filter(*pcl_wait_save_);
 
-    if (run_in_offline_ == false && scan_pub_en_) {
-        sensor_msgs::PointCloud2 laserCloudmsg;
-        pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
-        laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time_);
-        laserCloudmsg.header.frame_id = "camera_init";
-        pub_laser_cloud_world_.publish(laserCloudmsg);
-        publish_count_ -= options::PUBFRAME_PERIOD;
-    }
+    sensor_msgs::PointCloud2 MapCloudmsg;
+    pcl::toROSMsg(*pcl_wait_save_, MapCloudmsg);
+    MapCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time_);
+    MapCloudmsg.header.frame_id = "camera_init";
+    pub_laser_cloud_map_.publish(MapCloudmsg);
 
-    /**************** save map ****************/
-    /* 1. make sure you have enough memories
-    /* 2. noted that pcd save will influence the real-time performences **/
-    if (pcd_save_en_) {
-        *pcl_wait_save_ += *laserCloudWorld;
-
-        static int scan_wait_num = 0;
-        scan_wait_num++;
-        if (pcl_wait_save_->size() > 0 && pcd_save_interval_ > 0 && scan_wait_num >= pcd_save_interval_) {
-            pcd_index_++;
-            std::string all_points_dir(std::string(std::string(ROOT_DIR) + "PCD/scans_") + std::to_string(pcd_index_) +
-                                       std::string(".pcd"));
-            pcl::PCDWriter pcd_writer;
-            LOG(INFO) << "current scan saved to /PCD/" << all_points_dir;
-            pcd_writer.writeBinary(all_points_dir, *pcl_wait_save_);
-            pcl_wait_save_->clear();
-            scan_wait_num = 0;
-        }
-    }
-}
-
-void LaserMapping::PublishFrameBody(const ros::Publisher &pub_laser_cloud_body) {
-    int size = scan_undistort_->points.size();
-    PointCloudType::Ptr laser_cloud_imu_body(new PointCloudType(size, 1));
-
-    for (int i = 0; i < size; i++) {
-        PointBodyLidarToIMU(&scan_undistort_->points[i], &laser_cloud_imu_body->points[i]);
-    }
-
-    sensor_msgs::PointCloud2 laserCloudmsg;
-    pcl::toROSMsg(*laser_cloud_imu_body, laserCloudmsg);
-    laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time_);
-    laserCloudmsg.header.frame_id = "body";
-    pub_laser_cloud_body.publish(laserCloudmsg);
-    publish_count_ -= options::PUBFRAME_PERIOD;
+    nav_msgs::Odometry dop_msg;
+    dop_msg.header.stamp = ros::Time().fromSec(lidar_end_time_);
+    dop_msg.pose.pose.position.x = scan_dop;
+    dop_msg.pose.pose.position.y = matching_dop;
+    dop_msg.pose.pose.position.z = matching_dop - scan_dop;
+    pub_dop_.publish(dop_msg);
 }
 
 void LaserMapping::PublishFrameEffectWorld(const ros::Publisher &pub_laser_cloud_effect_world) {
@@ -922,7 +868,6 @@ void LaserMapping::Savetrajectory(const std::string &traj_file) {
     ofs.close();
 }
 
-///////////////////////////  private method /////////////////////////////////////////////////////////////////////
 template <typename T>
 void LaserMapping::SetPosestamp(T &out) {
     out.pose.position.x = state_point_.pos(0);
@@ -966,6 +911,45 @@ void LaserMapping::PointBodyLidarToIMU(PointType const *const pi, PointType *con
     po->intensity = pi->intensity;
 }
 
+double LaserMapping::computeDOP(const PointCloudType::Ptr& cloud, Eigen::Vector3d pos)
+{
+    PointCloudType::Ptr dop_cloud(new PointCloudType());
+    pcl::VoxelGrid<PointType> downSizeFilterDOP;
+    downSizeFilterDOP.setLeafSize(2, 2, 2);
+    downSizeFilterDOP.setInputCloud(cloud);
+    downSizeFilterDOP.filter(*dop_cloud);  
+
+    std::vector<Eigen::Vector3d> range_info;
+    for (size_t k = 0; k < dop_cloud->points.size(); k++)
+    {
+        double r = sqrt(pow((dop_cloud->points[k].x-pos(0)), 2) + pow((dop_cloud->points[k].y-pos(1)), 2) + pow((dop_cloud->points[k].z-pos(2)), 2));
+        if (r < preprocess_->Blind())    continue;
+        Eigen::Vector3d r_info;
+        r_info(0) = dop_cloud->points[k].x / r;
+        r_info(1) = dop_cloud->points[k].y / r;
+        r_info(2) = dop_cloud->points[k].z / r;
+        range_info.push_back(r_info);    
+    }
+    Eigen::MatrixXd AA(range_info.size(), 3);
+    for (size_t p = 0; p < range_info.size(); p++)
+    {
+        AA(p, 0) = range_info[p](0);
+        AA(p, 1) = range_info[p](1);
+        AA(p, 2) = range_info[p](2);
+    }
+    Eigen::Matrix3d A_sq;
+    Eigen::Matrix3d Q;
+    A_sq = AA.transpose() * AA;
+    Q = A_sq.inverse();
+
+    double pdop = sqrt(Q(0, 0) + Q(1, 1) + Q(2, 2));
+    if (pdop == 0 || pdop > 100 || std::isnan(pdop) == true)
+    {
+        pdop = 100;
+    }
+    return pdop;
+}
+
 void LaserMapping::Finish() {
     /**************** save map ****************/
     /* 1. make sure you have enough memories
@@ -973,9 +957,8 @@ void LaserMapping::Finish() {
     if (pcl_wait_save_->size() > 0 && pcd_save_en_) {
         std::string file_name = std::string("scans.pcd");
         std::string all_points_dir(std::string(std::string(ROOT_DIR) + "PCD/") + file_name);
-        pcl::PCDWriter pcd_writer;
         LOG(INFO) << "current scan saved to /PCD/" << file_name;
-        pcd_writer.writeBinary(all_points_dir, *pcl_wait_save_);
+        pcl::io::savePCDFileBinary(all_points_dir, *pcl_wait_save_); 
     }
 
     LOG(INFO) << "finish done";
