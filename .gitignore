@@ -3,3 +3,4 @@
 faster_lio/PCD/*.pcd
 pose_graph_optimization/Map/
 faster_lio/build/
+faster_lio/rviz_cfg/
