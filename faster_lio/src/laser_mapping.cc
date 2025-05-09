@@ -23,6 +23,24 @@ bool LaserMapping::InitROS(ros::NodeHandle &nh) {
         [this](state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data) { ObsModel(s, ekfom_data); },
         options::NUM_MAX_ITERATIONS, epsi.data());
 
+    // dop calc
+    double h_size = fov_degree/1024.0;
+    double v_size = (fov_u-fov_d)/preprocess_->NumScans();
+    PointCloudType::Ptr max_dop_cloud {new PointCloudType()}; 
+    for (int i = 0; i < preprocess_->NumScans(); i++)
+    {
+        for (int j = 0; j < 1024; j++)
+        {
+            PointType p;
+            p.x = det_range_ * cos((i*v_size+fov_d)*M_PI/180) * cos(j*h_size*M_PI/180);
+            p.y = det_range_ * cos((i*v_size+fov_d)*M_PI/180) * sin(j*h_size*M_PI/180);
+            p.z = det_range_ * sin((i*v_size+fov_d)*M_PI/180);
+            max_dop_cloud->points.push_back(p);
+        }
+    }
+    max_dop = computeDOP(max_dop_cloud, Eigen::Vector3d(0,0,0));
+    cout<<max_dop<<endl;
+
     return true;
 }
 
@@ -75,6 +93,7 @@ bool LaserMapping::LoadParams(ros::NodeHandle &nh) {
     nh.param<double>("filter_size_map", filter_size_map_min_, 0.0);
     nh.param<double>("cube_side_length", cube_len_, 200);
     nh.param<float>("mapping/det_range", det_range_, 300.f);
+    nh.param<int>("mapping/fov_degree", fov_degree, 360);
     nh.param<double>("mapping/gyr_cov", gyr_cov, 0.1);
     nh.param<double>("mapping/acc_cov", acc_cov, 0.1);
     nh.param<double>("mapping/b_gyr_cov", b_gyr_cov, 0.0001);
@@ -84,6 +103,8 @@ bool LaserMapping::LoadParams(ros::NodeHandle &nh) {
     nh.param<int>("preprocess/lidar_type", lidar_type, 1);
     nh.param<int>("preprocess/scan_line", preprocess_->NumScans(), 16);
     nh.param<int>("point_filter_num", point_filter_, 2);
+    nh.param<double>("posegraph/fov_u", fov_u, 15.0);
+    nh.param<double>("posegraph/fov_d", fov_d, -15.0);
     nh.param<bool>("feature_extract_enable", preprocess_->FeatureEnabled(), false);
     nh.param<bool>("runtime_pos_log_enable", runtime_pos_log_, true);
     nh.param<bool>("mapping/extrinsic_est_en", extrinsic_est_en_, true);
@@ -636,7 +657,7 @@ void LaserMapping::ObsModel(state_ikfom &s, esekfom::dyn_share_datastruct<double
                     temp[3] = 1.0;
                     float pd2 = plane_coef_[i].dot(temp);
 
-                    bool valid_corr = p_body.norm() > 64 * pd2 * pd2; 
+                    bool valid_corr = p_body.norm() > 81 * pd2 * pd2; 
                     if (valid_corr) {
                         point_selected_surf_[i] = true;
                         residuals_[i] = pd2;
@@ -832,6 +853,10 @@ void LaserMapping::PublishMap()
     dop_msg.pose.pose.position.x = scan_dop;
     dop_msg.pose.pose.position.y = matching_dop;
     dop_msg.pose.pose.position.z = matching_dop - scan_dop;
+    double scan_dop_ratio = scan_dop/max_dop;
+    double matching_dop_ratio = matching_dop/max_dop;
+    dop_msg.pose.pose.orientation.w = scan_dop_ratio;
+    dop_msg.pose.pose.orientation.x = matching_dop_ratio;
     pub_dop_.publish(dop_msg);
 }
 
