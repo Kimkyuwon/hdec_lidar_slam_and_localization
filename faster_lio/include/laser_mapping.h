@@ -175,6 +175,7 @@ class LaserMapping {
     double fov_u, fov_d;
     int fov_degree;
     double max_dop;
+    bool kf_flag = false;
 
     ///////////////////////// EKF inputs and output ///////////////////////////////////////////////////////
     common::MeasureGroup measures_;                    // sync IMU and lidar scan

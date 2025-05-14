@@ -36,7 +36,7 @@ posegraph:
     voxel_size: 0.1
     num_exclude_recent: 20
     num_candidates_from_tree: 20
-    dop_thres: 0.4
+    dop_thres: 5.0
 
 publish:
     path_publish_en:  false

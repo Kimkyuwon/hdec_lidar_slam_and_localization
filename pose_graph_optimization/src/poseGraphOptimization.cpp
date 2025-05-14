@@ -8,6 +8,7 @@
 #include <optional>
 #include <unistd.h>
 #include <condition_variable>
+#include <unordered_map>
 #include <ros/ros.h>
 #include <Eigen/Core>
 #include <nav_msgs/Odometry.h>
@@ -23,6 +24,8 @@
 #include <pcl/search/search.h>
 #include <pcl/console/print.h>
 #include <pcl/kdtree/kdtree_flann.h>
+#include <pcl/filters/statistical_outlier_removal.h>
+#include <pcl/filters/conditional_removal.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <sensor_msgs/Image.h>
 #include <cv_bridge/cv_bridge.h>
@@ -81,6 +84,11 @@ int NUM_ANGLE, NUM_RANGE, NUM_HEIGHT;
 int MIN_DISTANCE, MAX_DISTANCE, NUM_EXCLUDE_RECENT, NUM_CANDIDATES_FROM_TREE;
 queue<tuple<int, int, Eigen::Matrix4f>> solidLoopBuf; 
 
+int num_scan, fov_degree;
+double max_dop;
+float det_range_;
+double blind;
+
 // edge measurement params
 pcl::VoxelGrid<pcl::PointXYZI> downSizeFilter_map;
 nano_gicp::NanoGICP<PointType2, PointType2> gicp;
@@ -107,14 +115,13 @@ int recentIdxUpdated = 0;
 
 //range image 
 std::vector<std::vector<double>> scan_range_data;
-std::vector<std::vector<double>> map_range_data;
-int horizontal_resolution = static_cast<int>(2*M_PI/0.02);
+std::vector<std::vector<double>> prev_range_data;
+int horizontal_resolution = 1024;
 double LIDAR_HOR_MIN = -180.0F;
 double LIDAR_HOR_MAX = 180.0F;
 
 visualization_msgs::Marker loopLine;
 nav_msgs::Path PGO_path;
-pcl::PointCloud<pcl::PointXYZI>::Ptr MapCloud(new pcl::PointCloud<pcl::PointXYZI>());
 
 fstream odom_stream, optimized_stream;
 pcl::PointCloud<pcl::PointXYZI> kf_nodes;
@@ -126,7 +133,8 @@ ros::Publisher LoopLineMarker_pub;
 ros::Publisher PubPGO_path;
 ros::Publisher PubPGO_map;
 image_transport::Publisher PubScan_range; 
-image_transport::Publisher PubMap_range;
+image_transport::Publisher PubPrev_range;
+image_transport::Publisher PubDiff_range;
 
 void initNoises( void )
 {
@@ -161,53 +169,6 @@ Pose6 getOdom(nav_msgs::Odometry _odom)
 
     return Pose6{tx, ty, tz, roll, pitch, yaw};
 } // getOdom
-void insertPoint(const pcl::PointXYZI& pt, std::vector<std::vector<double>> &ri) 
-{
-    double range = std::sqrt(pt.x * pt.x + pt.y * pt.y + pt.z * pt.z);
-    if (range < 0.2) return;
-
-    double azimuth = std::atan2(pt.y, pt.x);
-    double elevation = std::asin(pt.z / range);
-
-    double vertical_fov_min = FOV_d*M_PI/180; 
-    double vertical_fov_max = FOV_u*M_PI/180;
-    double horizontal_fov_min = LIDAR_HOR_MIN*M_PI/180;    
-    double horizontal_fov_max = LIDAR_HOR_MAX*M_PI/180;
-    if (azimuth < horizontal_fov_min || azimuth > horizontal_fov_max ||
-        elevation < vertical_fov_min || elevation > vertical_fov_max) return;
-
-    int col = static_cast<int>((azimuth - horizontal_fov_min) / (horizontal_fov_max - horizontal_fov_min) * horizontal_resolution);
-    int row = static_cast<int>((elevation - vertical_fov_min) / (vertical_fov_max - vertical_fov_min) * NUM_HEIGHT);
-
-    if (row < 0) row = 0;
-    if (row >= NUM_HEIGHT) row = NUM_HEIGHT - 1;
-    if (col < 0) col = 0;
-    if (col >= horizontal_resolution) col = horizontal_resolution - 1;
-
-    if (range < ri[row][col]) 
-    {
-        ri[row][col] = range;
-    }
-}
-
-cv::Mat toColorizedCVImage(std::vector<std::vector<double>> &ri) 
-{
-    cv::Mat img(NUM_HEIGHT, horizontal_resolution, CV_8UC1, cv::Scalar(0));
-
-    for (int i = 0; i < NUM_HEIGHT; ++i) {
-        for (int j = 0; j < horizontal_resolution; ++j) {
-            if (!std::isinf(ri[i][j])) {
-                double norm_range = std::min(ri[i][j] / static_cast<double>(MAX_DISTANCE), 1.0);
-                img.at<uchar>(i, j) = static_cast<uchar>((1.0 - norm_range) * 255);
-            }
-        }
-    }
-
-    cv::Mat color_img;
-    cv::applyColorMap(img, color_img, cv::COLORMAP_JET);
-    cv::flip(color_img, color_img, 0); // 0은 상하 반전
-    return color_img;
-}
 
 Eigen::Matrix4f get_TF_Matrix(const Pose6 Pose)
 {
@@ -222,6 +183,144 @@ Eigen::Matrix4f get_TF_Matrix(const Pose6 Pose)
     TF(2,3) = Pose.z;
 
     return TF;
+}
+
+double computeDOP(const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud, Eigen::Vector3d pos)
+{
+    pcl::PointCloud<pcl::PointXYZI>::Ptr dop_cloud(new pcl::PointCloud<pcl::PointXYZI>());
+    pcl::VoxelGrid<pcl::PointXYZI> downSizeFilterDOP;
+    downSizeFilterDOP.setLeafSize(2, 2, 2);
+    downSizeFilterDOP.setInputCloud(cloud);
+    downSizeFilterDOP.filter(*dop_cloud);  
+    pcl::removeNaNFromPointCloud(*cloud, *cloud, indiceLet);
+    indiceLet.clear();
+
+    std::vector<Eigen::Vector3d> range_info;
+    for (size_t k = 0; k < dop_cloud->points.size(); k++)
+    {
+        double r = sqrt(pow((dop_cloud->points[k].x-pos(0)), 2) + pow((dop_cloud->points[k].y-pos(1)), 2) + pow((dop_cloud->points[k].z-pos(2)), 2));
+        if (r < blind)    continue;
+        Eigen::Vector3d r_info;
+        r_info(0) = dop_cloud->points[k].x / r;
+        r_info(1) = dop_cloud->points[k].y / r;
+        r_info(2) = dop_cloud->points[k].z / r;
+        range_info.push_back(r_info);    
+    }
+    Eigen::MatrixXd AA(range_info.size(), 3);
+    for (size_t p = 0; p < range_info.size(); p++)
+    {
+        AA(p, 0) = range_info[p](0);
+        AA(p, 1) = range_info[p](1);
+        AA(p, 2) = range_info[p](2);
+    }
+    Eigen::Matrix3d A_sq;
+    Eigen::Matrix3d Q;
+    A_sq = AA.transpose() * AA;
+    Q = A_sq.inverse();
+
+    double pdop = sqrt(Q(0, 0) + Q(1, 1) + Q(2, 2));
+    if (pdop == 0 || pdop > 100 || std::isnan(pdop) == true)
+    {
+        pdop = 100;
+    }
+    return pdop;
+}
+
+std::optional<gtsam::Pose3> doGICPVirtualRelative( int _loop_kf_idx, int _curr_kf_idx, Eigen::Matrix4f delta_TF)
+{
+    pcl::PointCloud<pcl::PointXYZI>::Ptr cureKeyframeCloud(new pcl::PointCloud<pcl::PointXYZI>());
+    pcl::PointCloud<pcl::PointXYZI>::Ptr targetKeyframeCloud(new pcl::PointCloud<pcl::PointXYZI>());
+    pcl::io::loadPCDFile(ScansDirectory + std::to_string(_curr_kf_idx) + ".pcd", *cureKeyframeCloud);
+    pcl::io::loadPCDFile(ScansDirectory + std::to_string(_loop_kf_idx) + ".pcd", *targetKeyframeCloud);
+    pcl::VoxelGrid<pcl::PointXYZI> downSizeFilter;
+    downSizeFilter.setLeafSize(0.4, 0.4, 0.4);
+    downSizeFilter.setInputCloud(cureKeyframeCloud);
+    downSizeFilter.filter(*cureKeyframeCloud);
+    downSizeFilter.setInputCloud(targetKeyframeCloud);
+    downSizeFilter.filter(*targetKeyframeCloud);
+
+    gicp.setInputTarget(targetKeyframeCloud);
+    // gicp.calculateSourceCovariances();
+    gicp.setInputSource(cureKeyframeCloud);
+    // gicp.calculateTargetCovariances();
+
+    pcl::PointCloud<pcl::PointXYZI>::Ptr aligned_cloud(new pcl::PointCloud<pcl::PointXYZI>());
+    gicp.align(*aligned_cloud, delta_TF);
+    Eigen::Matrix4f edge_TF = gicp.getFinalTransformation();
+    pcl::PointCloud<pcl::PointXYZI>::Ptr matchKeyframeCloud (new pcl::PointCloud<pcl::PointXYZI>());
+    pcl::transformPointCloud(*cureKeyframeCloud, *matchKeyframeCloud, edge_TF);
+
+    Eigen::Matrix<double, 6, 6> hessian = gicp.getHessian();
+    
+    typedef Eigen::EigenSolver<Eigen::Matrix<double, 6, 6>> EigenSolver;
+    EigenSolver es;
+    Eigen::Matrix<double, 6, 6> hessian_inv = hessian.inverse();
+    es.compute(hessian_inv);
+    
+    Eigen::VectorXcd eigenvalues = es.eigenvalues();
+
+    std::complex<double> max_eigenvalue = eigenvalues(0);
+    for (int i = 1; i < eigenvalues.size(); ++i) 
+    {
+        if (eigenvalues(i).real() > max_eigenvalue.real()) {
+
+            max_eigenvalue = eigenvalues(i);
+        }
+    }
+    double max_eigen = sqrt(fabs(max_eigenvalue.real()));
+
+    kdtree2->setInputCloud(targetKeyframeCloud);
+    pcl::PointCloud<pcl::PointXYZI>::Ptr MatchedCloud (new pcl::PointCloud<pcl::PointXYZI>());
+    for (int k = 0; k < matchKeyframeCloud->points.size(); k++)
+    {
+        kdtree2->nearestKSearch(matchKeyframeCloud->points[k], 1, pointSearchInd, pointSearchSqDis);
+        if (pointSearchSqDis[0] < 0.1)
+        {
+            MatchedCloud->points.push_back(matchKeyframeCloud->points[k]);
+        }
+    }
+
+    double matching_dop = computeDOP(MatchedCloud, Eigen::Vector3d(0,0,0));
+    double dop_ratio = matching_dop / max_dop;
+
+    // pcl::transformPointCloud(*cureKeyframeCloud, *cureKeyframeCloud, delta_TF);
+    // std::for_each(cureKeyframeCloud->points.begin(), cureKeyframeCloud->points.end(),
+    //               [](pcl::PointXYZI& point) { point.intensity = 1.0; });
+    // std::for_each(targetKeyframeCloud->points.begin(), targetKeyframeCloud->points.end(),
+    //               [](pcl::PointXYZI& point) { point.intensity = 2.0; });
+    // std::for_each(matchKeyframeCloud->points.begin(), matchKeyframeCloud->points.end(),
+    //               [](pcl::PointXYZI& point) { point.intensity = 3.0; });
+
+    // pcl::PointCloud<pcl::PointXYZI>::Ptr resultKeyframeCloud (new pcl::PointCloud<pcl::PointXYZI>());
+    // *resultKeyframeCloud += *cureKeyframeCloud;
+    // *resultKeyframeCloud += *targetKeyframeCloud;
+    // *resultKeyframeCloud += *matchKeyframeCloud;
+    // pcl::io::savePCDFileBinary(DebugDirectory + to_string(_curr_kf_idx) + "_" + to_string(dop_ratio) + "_" 
+    // + to_string(matching_dop) + ".pcd", *resultKeyframeCloud); // debug data
+
+    if (dop_ratio < dop_thres /*&& max_eigen < 0.005*/)
+    {
+        Eigen::Matrix3f edge_rot = edge_TF.block(0, 0, 3, 3);
+        Eigen::Quaternionf final_q(edge_rot);
+        // Get pose transformation
+        double roll, pitch, yaw;
+        tf::Matrix3x3(tf::Quaternion(final_q.x(), final_q.y(), final_q.z(), final_q.w())).getRPY(roll, pitch, yaw);
+        gtsam::Pose3 poseFrom = Pose3(Rot3::RzRyRx(0.0, 0.0, 0.0), Point3(0.0, 0.0, 0.0));
+        gtsam::Pose3 poseTo = Pose3(Rot3::RzRyRx(roll, pitch, yaw), Point3(edge_TF(0,3), edge_TF(1,3), edge_TF(2,3)));
+
+        double loopNoiseScore = max_eigen; // constant is ok...
+        robustNoiseVector6 << loopNoiseScore, loopNoiseScore, loopNoiseScore, loopNoiseScore, loopNoiseScore, loopNoiseScore;
+        robustLoopNoise = gtsam::noiseModel::Robust::Create(
+        gtsam::noiseModel::mEstimator::Cauchy::Create(2.0), // optional: replacing Cauchy by DCS or GemanMcClure is okay but Cauchy is empirically good.
+        gtsam::noiseModel::Diagonal::Variances(robustNoiseVector6));
+
+        isLoopClosed = true;
+        return poseFrom.between(poseTo);
+    }
+    else
+    {
+        return std::nullopt;
+    }
 }
 
 void kf_callback(const Frame::ConstPtr &kf_msg) 
@@ -242,39 +341,9 @@ void kf_callback(const Frame::ConstPtr &kf_msg)
     pcl::fromROSMsg(pc_msg, *curr_kf_pc);
     solidModule.down_sampling(*curr_kf_pc, curr_kf_pc_down);
     solidModule.makeAndSaveSolid(*curr_kf_pc_down);
-            
-    // scan_range_data.clear();
-    // scan_range_data.resize(NUM_HEIGHT, std::vector<double>(horizontal_resolution, std::numeric_limits<double>::infinity()));
-    // for (const auto& pt : curr_kf_pc_down->points)
-    // {
-    //     insertPoint(pt, scan_range_data);
-    // }
-    // cv::Mat img = toColorizedCVImage(scan_range_data);
-    // sensor_msgs::ImagePtr scanRange_msg = cv_bridge::CvImage(std_msgs::Header(), "bgr8", img).toImageMsg();
-    // scanRange_msg->header.stamp = curr_pose.header.stamp;
-    // scanRange_msg->header.frame_id = "camera_init";    
-    // PubScan_range.publish(scanRange_msg);
-
-    // map_range_data.clear();
-    // map_range_data.resize(NUM_HEIGHT, std::vector<double>(horizontal_resolution, std::numeric_limits<double>::infinity()));
-    
-    // Eigen::Matrix4f curr_TF = get_TF_Matrix(pose_curr);
-    // pcl::PointCloud<pcl::PointXYZI>::Ptr curr_MapCloud(new pcl::PointCloud<pcl::PointXYZI>());
-    // pcl::transformPointCloud(*MapCloud, *curr_MapCloud, curr_TF.inverse());
-    // for (const auto& pt : curr_MapCloud->points)
-    // {
-    //     insertPoint(pt, map_range_data);
-    // }
-    // cv::Mat map_img = toColorizedCVImage(map_range_data);
-    // sensor_msgs::ImagePtr mapRange_msg = cv_bridge::CvImage(std_msgs::Header(), "bgr8", map_img).toImageMsg();
-    // mapRange_msg->header.stamp = curr_pose.header.stamp;
-    // mapRange_msg->header.frame_id = "camera_init";    
-    // PubMap_range.publish(mapRange_msg);
-
          
-    pcl::io::savePCDFileBinary(ScansDirectory + to_string(curr_kf_idx) + ".pcd", *curr_kf_pc_down); // scan data
+    pcl::io::savePCDFileBinary(ScansDirectory + to_string(curr_kf_idx) + ".pcd", *curr_kf_pc); // scan data
     
-
     const int prev_node_idx = keyframePoses.size() - 2;
     const int curr_node_idx = keyframePoses.size() - 1; // becuase cpp starts with 0 (actually this index could be any number, but for simple implementation, we follow sequential indexing)
     
@@ -303,10 +372,12 @@ void kf_callback(const Frame::ConstPtr &kf_msg)
                             kf_poses[curr_node_idx].pose.covariance[28], 
                             kf_poses[curr_node_idx].pose.covariance[35];
         odomNoise = noiseModel::Diagonal::Variances(odomNoiseVector6);
-        
 
+        Eigen::Matrix4f to_TF = get_TF_Matrix(keyframePoses[curr_node_idx]);
+        Eigen::Matrix4f from_TF = get_TF_Matrix(keyframePoses[prev_node_idx]);
+        Eigen::Matrix4f delta_TF = from_TF.inverse() * to_TF;
         gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(prev_node_idx, curr_node_idx, relPose, odomNoise));
-        initialEstimate.insert(curr_node_idx, poseTo);
+        initialEstimate.insert(curr_node_idx, poseTo);        
     } 
 
     odom_stream << curr_kf.header.stamp.toSec() << " "
@@ -416,131 +487,6 @@ void performSOLiDLoopClosure(void)
     }
 } // performSOLiDLoopClosure
 
-std::optional<gtsam::Pose3> doGICPVirtualRelative( int _loop_kf_idx, int _curr_kf_idx, Eigen::Matrix4f delta_TF)
-{
-    pcl::PointCloud<pcl::PointXYZI>::Ptr cureKeyframeCloud(new pcl::PointCloud<pcl::PointXYZI>());
-    pcl::PointCloud<pcl::PointXYZI>::Ptr targetKeyframeCloud(new pcl::PointCloud<pcl::PointXYZI>());
-    pcl::io::loadPCDFile(ScansDirectory + std::to_string(_curr_kf_idx) + ".pcd", *cureKeyframeCloud);
-    pcl::io::loadPCDFile(ScansDirectory + std::to_string(_loop_kf_idx) + ".pcd", *targetKeyframeCloud);
-
-    gicp.setInputTarget(targetKeyframeCloud);
-    // gicp.calculateSourceCovariances();
-    gicp.setInputSource(cureKeyframeCloud);
-    // gicp.calculateTargetCovariances();
-
-    pcl::PointCloud<pcl::PointXYZI>::Ptr aligned_cloud(new pcl::PointCloud<pcl::PointXYZI>());
-    gicp.align(*aligned_cloud, delta_TF);
-    Eigen::Matrix4f edge_TF = gicp.getFinalTransformation();
-    pcl::PointCloud<pcl::PointXYZI>::Ptr matchKeyframeCloud (new pcl::PointCloud<pcl::PointXYZI>());
-    pcl::transformPointCloud(*cureKeyframeCloud, *matchKeyframeCloud, edge_TF);
-
-    Eigen::Matrix<double, 6, 6> hessian = gicp.getHessian();
-    
-    typedef Eigen::EigenSolver<Eigen::Matrix<double, 6, 6>> EigenSolver;
-    EigenSolver es;
-    Eigen::Matrix<double, 6, 6> hessian_inv = hessian.inverse();
-    es.compute(hessian_inv);
-    
-    Eigen::VectorXcd eigenvalues = es.eigenvalues();
-
-    std::complex<double> max_eigenvalue = eigenvalues(0);
-    for (int i = 1; i < eigenvalues.size(); ++i) 
-    {
-        if (eigenvalues(i).real() > max_eigenvalue.real()) {
-
-            max_eigenvalue = eigenvalues(i);
-        }
-    }
-    double max_eigen = sqrt(fabs(max_eigenvalue.real()));
-
-    kdtree2->setInputCloud(targetKeyframeCloud);
-    pcl::PointCloud<pcl::PointXYZI>::Ptr MatchedCloud (new pcl::PointCloud<pcl::PointXYZI>());
-    for (int k = 0; k < matchKeyframeCloud->points.size(); k++)
-    {
-        kdtree2->nearestKSearch(matchKeyframeCloud->points[k], 1, pointSearchInd, pointSearchSqDis);
-        if (pointSearchSqDis[0] < 0.1)
-        {
-            MatchedCloud->points.push_back(matchKeyframeCloud->points[k]);
-        }
-    }
-
-    pcl::VoxelGrid<pcl::PointXYZI> downSizeFilter;
-    downSizeFilter.setInputCloud(MatchedCloud);
-    downSizeFilter.setLeafSize(2.0, 2.0, 2.0);
-    downSizeFilter.setMinimumPointsNumberPerVoxel(2);
-    downSizeFilter.filter(*MatchedCloud);
-    pcl::removeNaNFromPointCloud(*MatchedCloud, *MatchedCloud, indiceLet);
-    indiceLet.clear();
-    std::vector<Eigen::Vector3d> range_info;
-    for (size_t k = 0; k < MatchedCloud->points.size(); k++)
-    {
-        double r = sqrt(pow((MatchedCloud->points[k].x), 2) + pow((MatchedCloud->points[k].y), 2) + pow((MatchedCloud->points[k].z), 2));
-        if (r < 1.0)
-        {
-            continue;
-        }
-        Eigen::Vector3d r_info;
-        r_info(0) = (MatchedCloud->points[k].x) / r;
-        r_info(1) = (MatchedCloud->points[k].y) / r;
-        r_info(2) = (MatchedCloud->points[k].z) / r;
-        range_info.push_back(r_info);
-    }
-    Eigen::MatrixXd AA(range_info.size(), 3);
-    for (size_t p = 0; p < range_info.size(); p++)
-    {
-        AA(p, 0) = range_info[p](0);
-        AA(p, 1) = range_info[p](1);
-        AA(p, 2) = range_info[p](2);
-    }
-    Eigen::Matrix3d A_sq;
-    Eigen::Matrix3d Q;
-    A_sq = AA.transpose() * AA;
-    Q = A_sq.inverse();
-    double pdop = sqrt(Q(0, 0) + Q(1, 1) + Q(2, 2));
-    if (pdop == 0 || pdop > 100 || std::isnan(pdop) == true)
-    {
-        pdop = 100;
-    }    
-
-    pcl::transformPointCloud(*cureKeyframeCloud, *cureKeyframeCloud, delta_TF);
-    std::for_each(cureKeyframeCloud->points.begin(), cureKeyframeCloud->points.end(),
-                  [](pcl::PointXYZI& point) { point.intensity = 1.0; });
-    std::for_each(targetKeyframeCloud->points.begin(), targetKeyframeCloud->points.end(),
-                  [](pcl::PointXYZI& point) { point.intensity = 2.0; });
-    std::for_each(matchKeyframeCloud->points.begin(), matchKeyframeCloud->points.end(),
-                  [](pcl::PointXYZI& point) { point.intensity = 3.0; });
-
-    pcl::PointCloud<pcl::PointXYZI>::Ptr resultKeyframeCloud (new pcl::PointCloud<pcl::PointXYZI>());
-    *resultKeyframeCloud += *cureKeyframeCloud;
-    *resultKeyframeCloud += *targetKeyframeCloud;
-    *resultKeyframeCloud += *matchKeyframeCloud;
-    pcl::io::savePCDFileBinary(DebugDirectory + to_string(_curr_kf_idx) + "_" + to_string(max_eigen) + "_" 
-    + to_string(pdop) + ".pcd", *resultKeyframeCloud); // debug data
-
-    if (pdop < dop_thres /*&& max_eigen < 0.005*/)
-    {
-        Eigen::Matrix3f edge_rot = edge_TF.block(0, 0, 3, 3);
-        Eigen::Quaternionf final_q(edge_rot);
-        // Get pose transformation
-        double roll, pitch, yaw;
-        tf::Matrix3x3(tf::Quaternion(final_q.x(), final_q.y(), final_q.z(), final_q.w())).getRPY(roll, pitch, yaw);
-        gtsam::Pose3 poseFrom = Pose3(Rot3::RzRyRx(0.0, 0.0, 0.0), Point3(0.0, 0.0, 0.0));
-        gtsam::Pose3 poseTo = Pose3(Rot3::RzRyRx(roll, pitch, yaw), Point3(edge_TF(0,3), edge_TF(1,3), edge_TF(2,3)));
-
-        double loopNoiseScore = max_eigen; // constant is ok...
-        robustNoiseVector6 << loopNoiseScore, loopNoiseScore, loopNoiseScore, loopNoiseScore, loopNoiseScore, loopNoiseScore;
-        robustLoopNoise = gtsam::noiseModel::Robust::Create(
-        gtsam::noiseModel::mEstimator::Cauchy::Create(2.0), // optional: replacing Cauchy by DCS or GemanMcClure is okay but Cauchy is empirically good.
-        gtsam::noiseModel::Diagonal::Variances(robustNoiseVector6));
-
-        isLoopClosed = true;
-        return poseFrom.between(poseTo);
-    }
-    else
-    {
-        return std::nullopt;
-    }
-}
 
 void process_lcd(void)
 {
@@ -629,19 +575,18 @@ void process_viz(void)
             
             pcl::PointCloud<pcl::PointXYZI>::Ptr cureKeyframeCloud(new pcl::PointCloud<pcl::PointXYZI>());
             pcl::io::loadPCDFile(ScansDirectory + std::to_string(i) + ".pcd", *cureKeyframeCloud);
+            
             pcl::transformPointCloud(*cureKeyframeCloud, *cureKeyframeCloud, TF);
             *VizMapCloud += *cureKeyframeCloud; 
+            downSizeFilter_map.setLeafSize(0.4, 0.4, 0.4);
+            downSizeFilter_map.setInputCloud(VizMapCloud);
+            downSizeFilter_map.filter(*VizMapCloud);
         }
-        downSizeFilter_map.setLeafSize(0.4, 0.4, 0.4);
-        downSizeFilter_map.setInputCloud(VizMapCloud);
-        downSizeFilter_map.filter(*VizMapCloud);
         sensor_msgs::PointCloud2 map_msg;
         pcl::toROSMsg(*VizMapCloud, map_msg);
         map_msg.header.frame_id = "camera_init";
         PubPGO_map.publish(map_msg);
         mViz.unlock();
-        MapCloud->points.clear();
-        *MapCloud = *VizMapCloud;
 
         std::chrono::milliseconds dura(2);
         std::this_thread::sleep_for(dura);
@@ -649,46 +594,182 @@ void process_viz(void)
             
 }
 
+void Scan2Range (pcl::PointCloud<pcl::PointXYZI>::Ptr pc, cv::Mat& rimg, cv::Mat& rimg_idx)
+{
+    for (int idx = 0; idx < pc->points.size(); idx++)
+    {
+        pcl::PointXYZI pt = pc->points[idx];
+        double range = std::sqrt(pt.x * pt.x + pt.y * pt.y + pt.z * pt.z);
+        if (range < MIN_DISTANCE) continue;
+
+        double azimuth = std::atan2(pt.y, pt.x);
+        double elevation = std::asin(pt.z / range);
+
+        double vertical_fov_min = FOV_d*M_PI/180; 
+        double vertical_fov_max = FOV_u*M_PI/180;
+        double horizontal_fov_min = LIDAR_HOR_MIN*M_PI/180;    
+        double horizontal_fov_max = LIDAR_HOR_MAX*M_PI/180;
+        if (azimuth < horizontal_fov_min || azimuth > horizontal_fov_max ||
+            elevation < vertical_fov_min || elevation > vertical_fov_max) continue;
+
+        int col = static_cast<int>((azimuth - horizontal_fov_min) / (horizontal_fov_max - horizontal_fov_min) * horizontal_resolution);
+        int row = static_cast<int>(NUM_HEIGHT - (elevation - vertical_fov_min) / (vertical_fov_max - vertical_fov_min) * NUM_HEIGHT);
+
+        if (row < 0) row = 0;
+        if (row >= NUM_HEIGHT) row = NUM_HEIGHT - 1;
+        if (col < 0) col = 0;
+        if (col >= horizontal_resolution) col = horizontal_resolution - 1;
+        
+        if (rimg.at<float>(row,col) > range)
+        {
+            rimg.at<float>(row,col) = range;
+            rimg_idx.at<int>(row,col) = idx;
+        }
+    }
+}
+
 void SigHandle(int sig)
 {
-    ROS_INFO("Saving graph optimization trajectory");
-    pcl::PointCloud<PointType>::Ptr OptimizedMapCloud(new pcl::PointCloud<PointType>());
-    for (int k = 0; k < keyframePosesUpdated.size(); k++)
-    {
-        Eigen::Matrix3f rotation;
-        rotation = Eigen::AngleAxisf(keyframePosesUpdated[k].yaw, Eigen::Vector3f::UnitZ())
-                    * Eigen::AngleAxisf(keyframePosesUpdated[k].pitch, Eigen::Vector3f::UnitY())
-                    * Eigen::AngleAxisf(keyframePosesUpdated[k].roll, Eigen::Vector3f::UnitX());
-        Eigen::Quaternionf q(rotation);
-        optimized_stream << keyframeTimes[k] << " "
-                << keyframePosesUpdated[k].x << " " << keyframePosesUpdated[k].y << " " << keyframePosesUpdated[k].z << " " 
-                << q.x() << " " << q.y() << " " << q.z() << " " << q.w() <<endl;
-        
-        Eigen::Matrix4f TF (Eigen::Matrix4f::Identity());
-        TF.block(0,0,3,3) = rotation;
-        TF(0,3) = keyframePosesUpdated[k].x;
-        TF(1,3) = keyframePosesUpdated[k].y;
-        TF(2,3) = keyframePosesUpdated[k].z;
-        pcl::PointCloud<PointType>::Ptr cureKeyframeCloud(new pcl::PointCloud<PointType>());
-        pcl::io::loadPCDFile(ScansDirectory + std::to_string(k) + ".pcd", *cureKeyframeCloud);
-        pcl::transformPointCloud(*cureKeyframeCloud, *cureKeyframeCloud, TF);
-        *OptimizedMapCloud += *cureKeyframeCloud;
-    }
-
-    pcl::VoxelGrid<PointType> downSizeFilter;
-    downSizeFilter.setLeafSize(0.4, 0.4, 0.4);
-    downSizeFilter.setInputCloud(OptimizedMapCloud);
-    downSizeFilter.filter(*OptimizedMapCloud);
-    pcl::io::savePCDFileBinary(save_directory + "OptimizedMap.pcd", *OptimizedMapCloud); 
-
-    ROS_INFO("Optimization trajectory file saved.");
     sig_buffer.notify_all();
     ros::shutdown(); // ROS 종료
 }
 
+void process_save()
+{
+    while(1)
+    {
+        char c = getchar();
+        if (c == 's')
+        {
+            ROS_INFO("Saving graph optimization trajectory");
+            pcl::PointCloud<pcl::PointXYZI>::Ptr OptimizedMapCloud(new pcl::PointCloud<pcl::PointXYZI>());
+            pcl::PointCloud<pcl::PointXYZI>::Ptr DynamicMapCloud(new pcl::PointCloud<pcl::PointXYZI>());
+            pcl::PointCloud<pcl::PointXYZI>::Ptr StaticMapCloud(new pcl::PointCloud<pcl::PointXYZI>());
+            for (int k = 0; k < keyframePosesUpdated.size(); k++)
+            {
+                int curr_idx = k;
+                Eigen::Matrix3f rotation;
+                rotation = Eigen::AngleAxisf(keyframePosesUpdated[k].yaw, Eigen::Vector3f::UnitZ())
+                            * Eigen::AngleAxisf(keyframePosesUpdated[k].pitch, Eigen::Vector3f::UnitY())
+                            * Eigen::AngleAxisf(keyframePosesUpdated[k].roll, Eigen::Vector3f::UnitX());
+                Eigen::Quaternionf q(rotation);
+                optimized_stream << keyframeTimes[k] << " "
+                        << keyframePosesUpdated[k].x << " " << keyframePosesUpdated[k].y << " " << keyframePosesUpdated[k].z << " " 
+                        << q.x() << " " << q.y() << " " << q.z() << " " << q.w() <<endl;
+                
+                Eigen::Matrix4f TF (Eigen::Matrix4f::Identity());
+                TF.block(0,0,3,3) = rotation;
+                TF(0,3) = keyframePosesUpdated[k].x;
+                TF(1,3) = keyframePosesUpdated[k].y;
+                TF(2,3) = keyframePosesUpdated[k].z;
+                pcl::PointCloud<pcl::PointXYZI>::Ptr cureKeyframeCloud(new pcl::PointCloud<pcl::PointXYZI>());
+                pcl::PointCloud<pcl::PointXYZI>::Ptr cure_gpc(new pcl::PointCloud<pcl::PointXYZI>());
+                pcl::io::loadPCDFile(ScansDirectory + std::to_string(k) + ".pcd", *cureKeyframeCloud);;
+
+                pcl::transformPointCloud(*cureKeyframeCloud, *cure_gpc, TF);
+                *OptimizedMapCloud += *cure_gpc;
+
+                if (curr_idx < 1)   
+                {
+                    *StaticMapCloud = *OptimizedMapCloud;
+                    continue;
+                }
+                
+                pcl::PointCloud<pcl::PointXYZI>::Ptr SW_KeyframeCloud (new pcl::PointCloud<pcl::PointXYZI>());
+                for (int i = 1; i <= 3; i++)
+                {
+                    pcl::PointCloud<pcl::PointXYZI>::Ptr prevKeyframeCloud (new pcl::PointCloud<pcl::PointXYZI>());
+                    if (curr_idx-i < 0)  break;
+                    pcl::io::loadPCDFile(ScansDirectory + std::to_string(curr_idx-i) + ".pcd", *prevKeyframeCloud);
+                    Eigen::Matrix4f to_TF = get_TF_Matrix(keyframePosesUpdated[curr_idx]);
+                    Eigen::Matrix4f from_TF = get_TF_Matrix(keyframePosesUpdated[curr_idx-i]);
+                    Eigen::Matrix4f delta_TF = from_TF.inverse() * to_TF;
+                    pcl::transformPointCloud(*prevKeyframeCloud, *prevKeyframeCloud, delta_TF.inverse());
+                    *SW_KeyframeCloud += *prevKeyframeCloud;
+                } 
+                
+                //Range Image 기반 동적 물체 제거
+                cv::Mat scan_rimg = cv::Mat(NUM_HEIGHT, horizontal_resolution, CV_32FC1, cv::Scalar::all(1000)); // float matrix, save range value 
+                cv::Mat scan_rimg_idx = cv::Mat(NUM_HEIGHT, horizontal_resolution, CV_32SC1, cv::Scalar::all(0));
+                Scan2Range(cureKeyframeCloud, scan_rimg, scan_rimg_idx);
+                
+
+                cv::Mat prev_rimg = cv::Mat(NUM_HEIGHT, horizontal_resolution, CV_32FC1, cv::Scalar::all(1000)); // float matrix, save range value 
+                cv::Mat prev_rimg_idx = cv::Mat(NUM_HEIGHT, horizontal_resolution, CV_32SC1, cv::Scalar::all(0));
+                Scan2Range(SW_KeyframeCloud, prev_rimg, prev_rimg_idx);
+
+                cv::Mat diff_rimg = cv::Mat(NUM_HEIGHT, horizontal_resolution, CV_32FC1, cv::Scalar::all(0.0));
+                cv::absdiff(scan_rimg, prev_rimg, diff_rimg);
+                pcl::PointCloud<pcl::PointXYZI>::Ptr diff_pc (new pcl::PointCloud<pcl::PointXYZI>());
+                pcl::PointCloud<pcl::PointXYZI>::Ptr static_pc (new pcl::PointCloud<pcl::PointXYZI>());
+                
+                for (int row_idx = 0; row_idx < diff_rimg.rows; row_idx++)
+                {
+                    for (int col_idx = 0; col_idx < diff_rimg.cols; col_idx++)
+                    {
+                        float this_diff = diff_rimg.at<float>(row_idx, col_idx);
+                        float this_range = scan_rimg.at<float>(row_idx, col_idx);
+                        int this_idx = scan_rimg_idx.at<int>(row_idx, col_idx);
+
+                        float adaptive_coeff = 0.03; 
+                        float adaptive_dynamic_descrepancy_threshold = adaptive_coeff * this_range; 
+                        if ( this_diff < 50 && this_diff > adaptive_dynamic_descrepancy_threshold) 
+                        {
+                            diff_pc->points.push_back(cureKeyframeCloud->points[this_idx]);
+                        }
+                        else
+                        {
+                            static_pc->points.push_back(cureKeyframeCloud->points[this_idx]);
+                        }
+                    }
+                }
+                
+                pcl::PointCloud<pcl::PointXYZI>::Ptr diff_gpc (new pcl::PointCloud<pcl::PointXYZI>());
+                pcl::PointCloud<pcl::PointXYZI>::Ptr static_gpc (new pcl::PointCloud<pcl::PointXYZI>());
+                pcl::transformPointCloud(*diff_pc, *diff_gpc, TF);
+                *DynamicMapCloud += *diff_gpc;
+                pcl::transformPointCloud(*static_pc, *static_gpc, TF);
+                *StaticMapCloud += *static_gpc;
+                
+                try {
+                    pcl::io::savePCDFileBinary(DebugDirectory + to_string(curr_idx) + "_d.pcd", *diff_pc);
+                } 
+                catch (const pcl::IOException& e) {
+                    ROS_ERROR("Failed to save Dynamic PCD file: %s", e.what());  
+                }
+                try {
+                    pcl::io::savePCDFileBinary(DebugDirectory + to_string(curr_idx) + "_s.pcd", *static_pc);
+                } 
+                catch (const pcl::IOException& e) {
+                    ROS_ERROR("Failed to save Static PCD file: %s", e.what());  
+                }
+                
+                float percent = static_cast<float>(curr_idx+1) / static_cast<float>(keyframePosesUpdated.size()) * 100;
+                std::cout << "\rProgress: " << percent << "%" << std::flush;
+            }
+
+            pcl::VoxelGrid<pcl::PointXYZI> downSizeMapFilter;
+            downSizeMapFilter.setLeafSize(0.4, 0.4, 0.4);
+            downSizeMapFilter.setInputCloud(OptimizedMapCloud);
+            downSizeMapFilter.filter(*OptimizedMapCloud);
+            pcl::io::savePCDFileBinary(save_directory + "OptimizedMap.pcd", *OptimizedMapCloud); 
+            
+            downSizeMapFilter.setInputCloud(DynamicMapCloud);
+            downSizeMapFilter.filter(*DynamicMapCloud);          
+            pcl::io::savePCDFileBinary(save_directory + "DynamicMap.pcd", *DynamicMapCloud); 
+
+            downSizeMapFilter.setInputCloud(StaticMapCloud);
+            downSizeMapFilter.filter(*StaticMapCloud);
+            pcl::io::savePCDFileBinary(save_directory + "StaticMap.pcd", *StaticMapCloud); 
+
+            ROS_INFO("\nOptimization trajectory file saved.");
+        }
+    }
+}
+
 int main(int argc, char** argv)
 {
-    ros::init(argc, argv, "pose_graph_optimization");
+    ros::init(argc, argv, "pose_graph_optimization", ros::init_options::NoSigintHandler);
     ros::NodeHandle nh;
     image_transport::ImageTransport it(nh);
 
@@ -721,6 +802,10 @@ int main(int argc, char** argv)
     unused = system((std::string("mkdir -p ") + DebugDirectory).c_str());
 
 
+    nh.param<int>("mapping/fov_degree", fov_degree, 360);
+    nh.param<int>("preprocess/scan_line", num_scan, 16);
+    nh.param<float>("mapping/det_range", det_range_, 300.f);
+    nh.param<double>("preprocess/blind", blind, 0.01);
     nh.param<double>("posegraph/r_solid_thres", R_SOLiD_THRES, 0.99);
     nh.param<double>("posegraph/fov_u", FOV_u, 2);
     nh.param<double>("posegraph/fov_d", FOV_d, -24.8);
@@ -762,7 +847,25 @@ int main(int argc, char** argv)
     PubPGO_path = nh.advertise<nav_msgs::Path>("/PGO_path", 1);
     PubPGO_map = nh.advertise<sensor_msgs::PointCloud2>("/PGO_map", 1);
     PubScan_range = it.advertise("/scan_range_image", 1);
-    PubMap_range = it.advertise("/map_range_image", 1);
+    PubPrev_range = it.advertise("/prev_range_image", 1);
+    PubDiff_range = it.advertise("/diff_range_image", 1);
+
+    // dop calc
+    double h_size = fov_degree/1024.0;
+    double v_size = (FOV_u-FOV_d)/num_scan;
+    pcl::PointCloud<pcl::PointXYZI>::Ptr max_dop_cloud {new pcl::PointCloud<pcl::PointXYZI>()}; 
+    for (int i = 0; i < num_scan; i++)
+    {
+        for (int j = 0; j < 1024; j++)
+        {
+            pcl::PointXYZI p;
+            p.x = det_range_ * cos((i*v_size+FOV_d)*M_PI/180) * cos(j*h_size*M_PI/180);
+            p.y = det_range_ * cos((i*v_size+FOV_d)*M_PI/180) * sin(j*h_size*M_PI/180);
+            p.z = det_range_ * sin((i*v_size+FOV_d)*M_PI/180);
+            max_dop_cloud->points.push_back(p);
+        }
+    }
+    max_dop = computeDOP(max_dop_cloud, Eigen::Vector3d(0,0,0));
 
     pcl::console::setVerbosityLevel(pcl::console::L_ALWAYS);
 
@@ -771,10 +874,11 @@ int main(int argc, char** argv)
     std::thread edge_calculation {process_edge};    //GICP based edge measurement calculation
     std::thread graph_optimization {process_optimization};  //pose graph optimization
     std::thread vis_map {process_viz};  //Map Visualization
+    std::thread save_map {process_save}; 
 
     ros::spin();
     odom_stream.close();
-    optimized_stream.close();
+    optimized_stream.close(); //Map Visualization
 
     return 0;
 }

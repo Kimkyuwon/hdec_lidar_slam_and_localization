@@ -306,10 +306,23 @@ void LaserMapping::Run() {
     }
 
     /// IMU process, kf prediction, undistortion
-    p_imu_->Process(measures_, kf_, scan_undistort_);
-    if (scan_undistort_->empty() || (scan_undistort_ == nullptr)) {
+    CloudPtr temp_scan_undistort_{new PointCloudType()}; 
+    p_imu_->Process(measures_, kf_, temp_scan_undistort_);
+    if (temp_scan_undistort_->empty() || (temp_scan_undistort_ == nullptr)) {
         LOG(WARNING) << "No point, skip this scan!";
         return;
+    }
+
+    scan_undistort_->points.clear();
+    for (const auto& point : temp_scan_undistort_->points)
+    {
+        float dx = point.x;
+        float dy = point.y;
+        float dz = point.z;
+        float distance_sq = sqrt(dx*dx + dy*dy + dz*dz);
+
+        if (distance_sq > det_range_ )  continue;
+        scan_undistort_->points.push_back(point);
     }
 
     /// the first scan
@@ -317,14 +330,14 @@ void LaserMapping::Run() {
         ivox_->AddPoints(scan_undistort_->points);
         first_lidar_time_ = measures_.lidar_bag_time_;
 
-        state_point_ = kf_.get_x();
-        pos_lidar_ = state_point_.pos + state_point_.rot * state_point_.offset_T_L_I;
-        prev_kf_pos = pos_lidar_;
-        odom_aft_mapped_.header.frame_id = "camera_init";
-        odom_aft_mapped_.child_frame_id = "body";
-        odom_aft_mapped_.header.stamp = ros::Time().fromSec(lidar_end_time_);// ros::Time().fromSec(lidar_end_time);
-        SetPosestamp(odom_aft_mapped_.pose);
-        PublishKeyFrame(pubKeyFrame);
+        // state_point_ = kf_.get_x();
+        // pos_lidar_ = state_point_.pos + state_point_.rot * state_point_.offset_T_L_I;
+        // prev_kf_pos = pos_lidar_;
+        // odom_aft_mapped_.header.frame_id = "camera_init";
+        // odom_aft_mapped_.child_frame_id = "body";
+        // odom_aft_mapped_.header.stamp = ros::Time().fromSec(lidar_end_time_);// ros::Time().fromSec(lidar_end_time);
+        // SetPosestamp(odom_aft_mapped_.pose);
+        // PublishKeyFrame(pubKeyFrame);
 
         flg_first_scan_ = false;
         return;
@@ -347,7 +360,7 @@ void LaserMapping::Run() {
                 double voxel_scale = 1.0/scale;
                 filter_size_surf_ad_ = voxel_scale * filter_size_surf_min_;
                 if (filter_size_surf_ad_ < 0.1)  filter_size_surf_ad_ = 0.1;
-                else if (filter_size_surf_ad_ > 1.2) filter_size_surf_ad_ = 1.2;
+                else if (filter_size_surf_ad_ > 1.0) filter_size_surf_ad_ = 1.0;
                 
                 point_filter_ad_ = static_cast<int>(voxel_scale * point_filter_);
                 if (point_filter_ad_ <= 1)  point_filter_ad_ = 1;
@@ -401,7 +414,7 @@ void LaserMapping::Run() {
 
     // update local map
     Timer::Evaluate(
-        [&, this]() {   MapIncremental(); }, 
+        [&, this]() {   MapIncremental();   }, 
         "Incremental Mapping");
 
     PublishOdometry(pub_odom_aft_mapped_);
@@ -414,10 +427,11 @@ void LaserMapping::Run() {
 
     /******* Publish key frame *******/
     double kf_dist = (pos_lidar_ - prev_kf_pos).norm();
-    if (kf_dist > kf_thres_)
+    if (kf_dist > kf_thres_ || !kf_flag)
     {
         PublishKeyFrame(pubKeyFrame);
         prev_kf_pos = pos_lidar_;
+        kf_flag = true;
     }   
 
     // Debug variables
@@ -857,6 +871,7 @@ void LaserMapping::PublishMap()
     double matching_dop_ratio = matching_dop/max_dop;
     dop_msg.pose.pose.orientation.w = scan_dop_ratio;
     dop_msg.pose.pose.orientation.x = matching_dop_ratio;
+    dop_msg.pose.pose.orientation.y = matching_dop_ratio - scan_dop_ratio;
     pub_dop_.publish(dop_msg);
 }
 

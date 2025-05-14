@@ -29,14 +29,14 @@ posegraph:
     fov_u: 22.5
     fov_d: -22.5
     num_angle: 120
-    num_range: 100
+    num_range: 50
     num_height: 64
     min_distance: 2
-    max_distance: 100
+    max_distance: 50
     voxel_size: 0.4
     num_exclude_recent: 100
     num_candidates_from_tree: 20
-    dop_thres: 0.45
+    dop_thres: 5.0
 
 publish:
     path_publish_en:  false
